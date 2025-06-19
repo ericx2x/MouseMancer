@@ -10,15 +10,13 @@ import signal
 import keyboard
 from pathlib import Path
 from pynput.mouse import Controller, Button
-#from playsound import playsound
 from pystray import Icon, MenuItem as Item, Menu
 from PIL import Image, ImageDraw
 
-# === Sound Paths ===
-#SOUND_ON = "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"
-#SOUND_OFF = "/usr/share/sounds/freedesktop/stereo/service-logout.oga"
+from Xlib import X, display, Xutil
+from Xlib.protocol import event as XEvent
 
-# Define keycodes for xmodmap suppression
+# === Key Suppression Maps ===
 suppressed_keycodes = {
     'w': 25, 'a': 38, 's': 39, 'd': 40, 'f': 41,
     'i': 31, 'j': 44, 'k': 45, 'l': 46, 'space': 65, 'n': 57,
@@ -30,24 +28,50 @@ original_keymap = {
     'space': 'space', 'n': 'n N',
 }
 
-# Mouse controller
+# === Globals ===
 mouse_controller = Controller()
-
-# Movement settings
-default_speed = 10
-slow_speed = 3
-fast_speed = 20
-
-# State
 mouse_mode_active = False
-cursor_speed = default_speed
+cursor_speed = 10
 pressed_keys = set()
+icon = None
+x_display = None
+focus_trap_window = None
 
-# Keys
+# === Key Groups ===
 toggle_keys = {'f', 'j', 'q', 'a'}
 movement_keys = {'w', 'a', 's', 'd'}
 suppressed_keys = movement_keys.union({'f', 'i', 'j', 'k', 'space', 'l', 'n'})
 
+# === Focus Trap Window (Xlib) ===
+def start_focus_trap():
+    global x_display, focus_trap_window
+    x_display = display.Display()
+    root = x_display.screen().root
+
+    focus_trap_window = root.create_window(
+        0, 0, 1, 1, 0,
+        x_display.screen().root_depth,
+        X.InputOutput,
+        X.CopyFromParent,
+        background_pixel=0,
+        event_mask=X.FocusChangeMask
+    )
+
+    focus_trap_window.set_wm_name("FocusTrap")
+    focus_trap_window.set_wm_hints(flags=Xutil.InputHint, input=True)
+    focus_trap_window.set_wm_normal_hints(flags=Xutil.PPosition | Xutil.PSize)
+    focus_trap_window.map()
+    focus_trap_window.set_input_focus(X.RevertToParent, X.CurrentTime)
+    x_display.sync()
+
+def stop_focus_trap():
+    global x_display, focus_trap_window
+    if focus_trap_window:
+        focus_trap_window.destroy()
+        x_display.sync()
+        focus_trap_window = None
+
+# === Key Suppression ===
 def suppress_keys():
     for key, code in suppressed_keycodes.items():
         subprocess.run(["xmodmap", "-e", f"keycode {code} = NoSymbol"], check=False)
@@ -59,21 +83,7 @@ def restore_keys():
 
 atexit.register(restore_keys)
 
-def defocus_text_inputs():
-    # Save current mouse position
-    pos = mouse_controller.position
-
-    try:
-        # Try to focus GNOME "Top Bar" or fallback to root
-        panel_id = subprocess.check_output([
-            "xdotool", "search", "--name", "Top Bar"
-        ]).decode().strip().split('\n')[0]
-        subprocess.run(["xdotool", "windowfocus", panel_id], check=False)
-    except Exception:
-        subprocess.run(["xdotool", "windowfocus", "root"], check=False)
-
-    # Restore mouse position
-    mouse_controller.position = pos
+# === Mouse Mode Toggle ===
 def toggle_mouse_mode():
     global mouse_mode_active
     mouse_mode_active = not mouse_mode_active
@@ -81,27 +91,20 @@ def toggle_mouse_mode():
 
     if mouse_mode_active:
         suppress_keys()
-        defocus_text_inputs()  # <-- Add this here
+        start_focus_trap()
         show_overlay_message("MOUSE MODE ON")
     else:
         restore_keys()
+        stop_focus_trap()
         show_overlay_message("MOUSE MODE OFF")
 
     update_icon()
-
-def notify_suppression(state):
-    show_overlay_message("SUPPRESSION ON" if state else "SUPPRESSION OFF")
 
 def print_status():
     os.system('clear')
     print(f"[Mouse Mode] {'ON' if mouse_mode_active else 'OFF'}")
 
-# def play_sound(path):
-#    try:
-#        playsound(path)
-#    except Exception:
-#        os.system('play -nq -t alsa synth 0.2 sine 440')
-
+# === Mouse Control ===
 def mouse_loop():
     global cursor_speed
     while True:
@@ -110,11 +113,11 @@ def mouse_loop():
             continue
 
         if 'n' in pressed_keys:
-            cursor_speed = slow_speed
+            cursor_speed = 3
         elif 'space' in pressed_keys or 'l' in pressed_keys:
-            cursor_speed = fast_speed
+            cursor_speed = 20
         else:
-            cursor_speed = default_speed
+            cursor_speed = 10
 
         if 'w' in pressed_keys:
             mouse_controller.move(0, -cursor_speed)
@@ -127,6 +130,7 @@ def mouse_loop():
 
         time.sleep(0.01)
 
+# === Keyboard Event Handling ===
 def on_key_event(e):
     key = e.name
 
@@ -161,10 +165,7 @@ def on_key_event(e):
 
     return None
 
-# --- System Tray ---
-
-icon = None
-
+# === System Tray ===
 def show_overlay_message(message):
     script_path = Path(__file__).parent / "overlay.py"
     subprocess.Popen(["python3", str(script_path), message])
@@ -190,21 +191,24 @@ def tray_thread():
     icon.icon = create_image(mouse_mode_active)
     icon.run()
 
+# === Exit Handlers ===
 def exit_program():
     restore_keys()
+    stop_focus_trap()
     if icon:
         icon.stop()
     sys.exit()
 
 def signal_handler(sig, frame):
     restore_keys()
+    stop_focus_trap()
     exit_program()
 
-signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
-signal.signal(signal.SIGTERM, signal_handler)  # `kill <pid>`
-signal.signal(signal.SIGQUIT, signal_handler)  # `kill -3 <pid>`
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGQUIT, signal_handler)
 
-# --- Main ---
+# === Main ===
 if __name__ == "__main__":
     print("MouseMancer Started - Press Caps Lock + F/J/Q/A to toggle mouse mode.")
     print("NOTE: You MUST run this script with sudo on Linux X11 for suppression to work.")
@@ -213,5 +217,4 @@ if __name__ == "__main__":
     threading.Thread(target=tray_thread, daemon=True).start()
     keyboard.hook(on_key_event)
     keyboard.wait()
-
 
